@@ -18,7 +18,7 @@ void print_board(char board[ROWS][COLS]) {
 }
 
 int main(void) {
-    printf("Welcome to Connect Four!");
+    printf("Welcome to Connect Four!\n");
     char board[ROWS][COLS];
     char players[2] = {'A', 'B'};
     int current = 0;   // 0 = Player A, 1 = Player B
