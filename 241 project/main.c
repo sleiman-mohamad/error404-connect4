@@ -5,7 +5,7 @@
 
 void print_board(char board[ROWS][COLS]) {
     
-    printf("\n  1 2 3 4 5 6 7\n");
+   
     for (int r = 0; r < ROWS; r++) {
         printf(" |");
         for (int c = 0; c < COLS; c++) {
@@ -13,6 +13,7 @@ void print_board(char board[ROWS][COLS]) {
         }
         printf("\n");
     }
+     printf("\n  1 2 3 4 5 6 7\n");
     
 }
 
