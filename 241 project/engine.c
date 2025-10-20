@@ -1,3 +1,6 @@
+#include <stdio.h>    // optional, but okay
+#include <stdlib.h>   // for rand(), srand()
+#include <time.h>     // for time()
 #include "engine.h"
 #define ROWS 6
 #define COLS 7
@@ -18,13 +21,31 @@ int place_piece(char board[ROWS][COLS], int col, char player) {
     if (c < 0 || c >= COLS) return -1;
 
     for (int r = ROWS - 1; r >= 0; r--) {
-        if (board[r][c] == '.') {
+        if (board[r][c] == '.') { 
             board[r][c] = player;
             return r;
         }
     }
     return -1; // column full
 }
+#include <time.h>
+
+int getBotMoveEasy(char board[ROWS][COLS]) {
+    srand(time(NULL));
+    int valid_cols[COLS];
+    int count = 0;
+
+    for (int c = 1; c <= COLS; c++) {
+        if (board[0][c - 1] == '.') {
+            valid_cols[count++] = c;
+        }
+    }
+
+    if (count == 0) return 1; // fallback (board full)
+    int random_index = rand() % count;
+    return valid_cols[random_index];
+}
+
 
 // check in one direction how many matching pieces
 static int count_dir(char board[ROWS][COLS], int r, int c, int dr, int dc) {
