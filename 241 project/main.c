@@ -17,8 +17,19 @@ void print_board(char board[ROWS][COLS]) {
     printf("  1 2 3 4 5 6 7\n");
 }
 
+// Helper to check if input is "exit"
+int is_exit_command(const char *input) {
+    char temp[50];
+    strncpy(temp, input, sizeof(temp));
+    temp[sizeof(temp)-1] = '\0';
+    for (int i = 0; temp[i]; i++) temp[i] = tolower(temp[i]);
+    return strcmp(temp, "exit") == 0;
+}
+
 int main(void) {
     printf("Welcome to Connect Four!\n");
+    printf("Type 'exit' anytime to quit.\n\n");
+
     srand(time(NULL)); // seed random once
 
     char board[ROWS][COLS];
@@ -30,10 +41,15 @@ int main(void) {
     char mode[20];
     char difficulty[20];
 
-    // ✅ Keep asking until valid mode
+    // ✅ Keep asking until valid mode or exit
     while (1) {
         printf("Type 'bot' to play against a bot, or 'multiplayer' for two players: ");
         scanf("%19s", mode);
+
+        if (is_exit_command(mode)) {
+            printf("Exiting game. Goodbye!\n");
+            return 0;
+        }
 
         for (int i = 0; mode[i]; i++)
             mode[i] = tolower(mode[i]);
@@ -41,10 +57,15 @@ int main(void) {
         if (strcmp(mode, "bot") == 0) {
             bot_enabled = 1;
 
-            // ✅ Keep asking until valid difficulty
+            // ✅ Keep asking until valid difficulty or exit
             while (1) {
                 printf("Choose difficulty (only 'easy' available): ");
                 scanf("%19s", difficulty);
+
+                if (is_exit_command(difficulty)) {
+                    printf("Exiting game. Goodbye!\n");
+                    return 0;
+                }
 
                 for (int i = 0; difficulty[i]; i++)
                     difficulty[i] = tolower(difficulty[i]);
@@ -106,9 +127,14 @@ int main(void) {
             }
         }
 
-        printf("Play again? (y/n): ");
+        printf("Play again? (y/n or 'exit'): ");
         scanf(" %c", &again);
-        while (getchar() != '\n');
+        if (tolower(again) == 'e') {
+            printf("Exiting game. Goodbye!\n");
+            break;
+        }
+
+        while (getchar() != '\n'); // clear leftover input
 
     } while (again == 'y' || again == 'Y');
 
