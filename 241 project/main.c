@@ -30,7 +30,7 @@ int main(void) {
     printf("Welcome to Connect Four!\n");
     printf("Type 'exit' anytime to quit.\n\n");
 
-    srand(time(NULL)); // seed random once
+    
 
     char board[ROWS][COLS];
     char players[2] = {'A', 'B'};
