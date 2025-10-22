@@ -27,6 +27,7 @@ int is_exit_command(const char *input) {
 }
 
 int main(void) {
+    setbuf(stdout, NULL);
     printf("Welcome to Connect Four!\n");
     printf("Type 'exit' anytime to quit.\n\n");
 
