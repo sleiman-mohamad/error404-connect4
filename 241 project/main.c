@@ -7,8 +7,6 @@
 #include "engine.h"
 
 void print_board(char board[ROWS][COLS]) {
-    
-   
     for (int r = 0; r < ROWS; r++) {
         printf(" |");
         for (int c = 0; c < COLS; c++) {
@@ -16,11 +14,8 @@ void print_board(char board[ROWS][COLS]) {
         }
         printf("\n");
     }
-     printf("  1 2 3 4 5 6 7\n");
-    
+    printf("  1 2 3 4 5 6 7\n");
 }
-
-
 
 int main(void) {
     printf("Welcome to Connect Four!\n");
@@ -32,42 +27,48 @@ int main(void) {
     char again;
 
     int bot_enabled = 0;
-    char mode[10];
-    char difficulty[10];
+    char mode[20];
+    char difficulty[20];
 
-    printf("Type 'bot' to play against a bot, or '2p' for two players: ");
-    scanf("%9s", mode);
+    // ✅ Keep asking until valid mode
+    while (1) {
+        printf("Type 'bot' to play against a bot, or 'multiplayer' for two players: ");
+        scanf("%19s", mode);
 
-    // Convert to lowercase for flexibility
-    for (int i = 0; mode[i]; i++)
-        mode[i] = tolower(mode[i]);
+        for (int i = 0; mode[i]; i++)
+            mode[i] = tolower(mode[i]);
 
-    if (strcmp(mode, "bot") == 0) {
-        bot_enabled = 1;
-        printf("Choose difficulty: ");
-        scanf("%9s", difficulty);
+        if (strcmp(mode, "bot") == 0) {
+            bot_enabled = 1;
 
-        for (int i = 0; difficulty[i]; i++)
-            difficulty[i] = tolower(difficulty[i]);
+            // ✅ Keep asking until valid difficulty
+            while (1) {
+                printf("Choose difficulty (only 'easy' available): ");
+                scanf("%19s", difficulty);
 
-        if (strcmp(difficulty, "easy") != 0) {
-            printf("Invalid difficulty! Only 'easy' is available for now.\n");
-            return 0;  // stop the program
+                for (int i = 0; difficulty[i]; i++)
+                    difficulty[i] = tolower(difficulty[i]);
+
+                if (strcmp(difficulty, "easy") == 0) {
+                    printf("Starting bot mode (easy difficulty)...\n");
+                    break;
+                } else {
+                    printf("Invalid difficulty! Only 'easy' is available.\n");
+                }
+            }
+            break;
+        } 
+        else if (strcmp(mode, "multiplayer") == 0) {
+            printf("Starting multiplayer mode...\n");
+            break;
+        } 
+        else {
+            printf("Invalid input! Please type 'bot' or 'multiplayer'.\n");
         }
-
-        printf("Starting bot mode (easy difficulty)...\n");
-    } 
-    else if (strcmp(mode, "2p") == 0) {
-        printf("Starting 2-player mode...\n");
-    } 
-    else {
-        printf("Invalid input! Please restart the game and type 'bot' or '2p'.\n");
-        return 0;  // stop the program if mode is wrong
     }
 
     while (getchar() != '\n'); // clear buffer
 
-    
     do {
         init_board(board);
         int game_over = 0;
@@ -77,7 +78,7 @@ int main(void) {
 
             int col;
             if (bot_enabled && current == 1) {
-                col = getBotMoveEasy(board); // bot’s move
+                col = getBotMoveEasy(board);
                 printf("Bot chooses column %d\n", col);
             } else {
                 col = getColumnIn(players[current]);
