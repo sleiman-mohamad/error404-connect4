@@ -6,7 +6,7 @@
 
 /* Strong Connect-4 AI (15s budget):
  * - Bitboard with sentinel row (7 bits per column)
- * - (position, mask) representation (gamesolver style)
+ * - Explicit P0/P1 bitboards + incremental Zobrist key
  * - Negamax + alpha-beta + transposition table
  * - Iterative deepening with aspiration windows
  * - Heuristic: center control + window scoring
@@ -28,6 +28,7 @@ static inline unsigned long long bottom_mask(int col) { return 1ULL << (col * 7)
 static inline unsigned long long top_mask(int col)    { return 1ULL << (col * 7 + 5); }
 /* Zobrist hashing for TT keys */
 static unsigned long long zobrist[7][6][2];
+static unsigned long long zobrist_side = 0;
 static int zobrist_ready = 0;
 static int tt_initialized = 0;
 
@@ -47,21 +48,30 @@ static void init_zobrist(void) {
             zobrist[c][r][1] = splitmix64(&seed);
         }
     }
+    zobrist_side = splitmix64(&seed);
     zobrist_ready = 1;
 }
 
-/* Position representation (gamesolver style):
- * - position: stones of player to move
- * - mask    : stones of both players (occupancy)
- * Opponent stones = mask ^ position
+/* Position representation (explicit):
+ * - bb[0], bb[1]: stones for player 0 and player 1
+ * - player_to_move: 0 or 1
+ * - zkey: incremental zobrist including side-to-move
  */
 typedef struct {
-    unsigned long long position;
-    unsigned long long mask;
+    unsigned long long bb[2];
+    unsigned long long zkey;
+    int player_to_move;
 } Position;
 
 /* Forward declarations for helpers used before definition */
 static int count_immediate_wins(const Position *p);
+static int list_immediate_wins(const Position *p, int cols_out[7]);
+static inline int timed_out(clock_t start_time);
+static inline void flip_player(Position *p);
+static inline int popcount_u64(unsigned long long x);
+static inline int column_height(unsigned long long occ, int col);
+static int parity_score(const Position *p);
+static const int VCF_MAX_DEPTH = 24;
 
 /* ----- win detection on a single bitboard ----- */
 static inline int has_won_bb(unsigned long long bb) {
@@ -87,20 +97,58 @@ static inline int has_won_bb(unsigned long long bb) {
 }
 
 static inline unsigned long long opponent_bb(const Position *p) {
-    return p->mask ^ p->position;
+    return p->bb[p->player_to_move ^ 1];
+}
+
+static inline unsigned long long mask_all(const Position *p) {
+    return p->bb[0] | p->bb[1];
 }
 
 static inline int can_play(const Position *p, int col) {
-    return (p->mask & top_mask(col)) == 0;
+    return (mask_all(p) & top_mask(col)) == 0;
 }
 
-/* gamesolver-style make_move:
- * position ^= mask;            // flip player to move
- * mask     |= mask + bottom_mask(col);  // drop a piece
- */
+static inline int empties_on_board(const Position *p) {
+    /* 42 playable cells on a 7x6 board */
+    unsigned long long occ = mask_all(p);
+    int bits = 0;
+    while (occ) { occ &= (occ - 1); bits++; }
+    return 42 - bits;
+}
+
 static inline void make_move(Position *p, int col) {
-    p->position ^= p->mask;
-    p->mask     |= p->mask + bottom_mask(col);
+    unsigned long long occ = mask_all(p);
+    unsigned long long move_bit = (occ + bottom_mask(col)) & ~occ;
+
+    /* derive row from bit index */
+    unsigned long long tmp = move_bit;
+    int idx = 0;
+    while ((tmp & 1ULL) == 0) { tmp >>= 1; idx++; }
+    int row = idx - col * 7;
+
+    int player = p->player_to_move;
+    p->bb[player] |= move_bit;
+    /* update zobrist incrementally */
+    if (row < 6) {
+        p->zkey ^= zobrist[col][row][player];
+    }
+    flip_player(p);
+}
+
+static inline void flip_player(Position *p) {
+    p->player_to_move ^= 1;
+    p->zkey ^= zobrist_side;
+}
+
+static inline int popcount_u64(unsigned long long x) {
+    int c = 0;
+    while (x) { x &= (x - 1); c++; }
+    return c;
+}
+
+static inline int column_height(unsigned long long occ, int col) {
+    unsigned long long col_mask = 0x3FULL << (col * 7); /* 6 bits + sentinel */
+    return popcount_u64(occ & col_mask);
 }
 
 /* any legal moves left? */
@@ -118,7 +166,7 @@ static inline int board_full_pos(const Position *p) {
 #define TT_MASK (TT_SIZE - 1)
 
 typedef struct {
-    unsigned long long key; /* position + mask */
+    unsigned long long key; /* zobrist key */
     int depth;              /* remaining depth searched */
     int value;              /* score from side-to-move POV */
     char flag;              /* 0 exact, 1 lowerbound, 2 upperbound */
@@ -129,24 +177,26 @@ typedef struct {
 static TTEntry ttable[TT_SIZE];
 static unsigned char tt_generation = 1;
 
+/* Lightweight TT for VCF/VCT search */
+#define VCF_TT_BITS 18           /* 256K entries */
+#define VCF_TT_SIZE (1U << VCF_TT_BITS)
+#define VCF_TT_MASK (VCF_TT_SIZE - 1)
+typedef struct {
+    unsigned long long key;
+    unsigned char depth;   /* depth searched */
+    char result;           /* -1 loss, 0 unknown, 1 win */
+    unsigned char gen;
+} VCFEntry;
+static VCFEntry vcf_table[VCF_TT_SIZE];
+static unsigned char vcf_generation = 1;
+
 /* Killer moves + history heuristic */
 #define MAX_PLY 64
 static int killer_moves[2][MAX_PLY]; /* two killers per ply */
 static int history_table[7];
 
 static inline unsigned long long tt_key(const Position *p) {
-    /* Zobrist over board contents, encoded as to-move vs opponent. */
-    unsigned long long key = 0;
-    unsigned long long player = p->position;
-    unsigned long long opp    = p->mask ^ p->position;
-    for (int c = 0; c < 7; c++) {
-        for (int r = 0; r < 6; r++) {
-            unsigned long long bit = 1ULL << (c * 7 + r);
-            if (player & bit)      key ^= zobrist[c][r][0];
-            else if (opp & bit)    key ^= zobrist[c][r][1];
-        }
-    }
-    return key;
+    return p->zkey;
 }
 
 static inline int tt_idx_u64(unsigned long long k) {
@@ -163,7 +213,35 @@ static void init_tt(void) {
         ttable[i].move = -1;
         ttable[i].gen  = 0;
     }
+    for (int i = 0; i < VCF_TT_SIZE; i++) {
+        vcf_table[i].key = 0;
+        vcf_table[i].depth = 0;
+        vcf_table[i].result = 0;
+        vcf_table[i].gen = 0;
+    }
     tt_initialized = 1;
+}
+
+static inline int vcf_idx(unsigned long long k) {
+    return (int)(k & VCF_TT_MASK);
+}
+
+static inline int vcf_probe(const Position *p, int depth_rem) {
+    VCFEntry *e = &vcf_table[vcf_idx(p->zkey)];
+    if (e->gen == vcf_generation && e->key == p->zkey && e->depth >= depth_rem) {
+        return (int)e->result;
+    }
+    return 0;
+}
+
+static inline void vcf_store(const Position *p, int depth_rem, int result) {
+    VCFEntry *e = &vcf_table[vcf_idx(p->zkey)];
+    if (e->gen != vcf_generation || depth_rem >= e->depth) {
+        e->key = p->zkey;
+        e->depth = (unsigned char)depth_rem;
+        e->result = (char)result;
+        e->gen = vcf_generation;
+    }
 }
 
 /* center-first move order */
@@ -187,8 +265,8 @@ static void gen_moves(const Position *p, int moves[7], int *count) {
  */
 static inline int cell_at(const Position *p, int r, int c) {
     unsigned long long bit = 1ULL << (c * 7 + r);
-    if (p->position & bit)      return 1;
-    if (opponent_bb(p) & bit)   return -1;
+    if (p->bb[p->player_to_move] & bit)      return 1;
+    if (p->bb[p->player_to_move ^ 1] & bit)  return -1;
     return 0;
 }
 
@@ -219,6 +297,9 @@ static int evaluate_position_internal(const Position *p, int include_threats) {
         score += v * 4;
     }
 
+    /* parity / tempo bias: odd remaining cells in a column favor side to move */
+    score += parity_score(p);
+
     /* horizontal windows */
     for (int r = 0; r < 6; r++) {
         for (int c = 0; c <= 3; c++) {
@@ -248,7 +329,7 @@ static int evaluate_position_internal(const Position *p, int include_threats) {
         /* Threat and double-threat awareness */
         int threats_me = count_immediate_wins(p);
         Position opp_view = *p;
-        opp_view.position ^= opp_view.mask;
+        flip_player(&opp_view);
         int threats_opp = count_immediate_wins(&opp_view);
 
         score += (threats_me - threats_opp) * 200;
@@ -261,6 +342,217 @@ static int evaluate_position_internal(const Position *p, int include_threats) {
 
 static inline int evaluate_position(const Position *p) {
     return evaluate_position_internal(p, 1);
+}
+
+/* ----- parity-aware heuristic ----- */
+static int parity_score(const Position *p) {
+    int s = 0;
+    unsigned long long occ = mask_all(p);
+    for (int c = 0; c < COLS; c++) {
+        int h = column_height(occ, c);
+        if (h >= 6) continue;
+        int remaining = 6 - h;
+        /* odd remaining cells -> side to move gets the top cell */
+        int parity_bonus = (remaining & 1) ? 30 : -30;
+        /* weight center columns slightly more */
+        int center_weight = 3 - (c > 3 ? c - 3 : 3 - c); /* 3,2,1,0,1,2,3 */
+        s += parity_bonus * (center_weight + 1);
+
+        /* bottom threat: if this is the last cell and we win by playing here */
+        if (remaining == 1) {
+            Position tmp = *p;
+            make_move(&tmp, c);
+            if (has_won_bb(opponent_bb(&tmp))) s += 200;
+            Position opp = *p;
+            flip_player(&opp);
+            make_move(&opp, c);
+            if (has_won_bb(opponent_bb(&opp))) s -= 200;
+        }
+    }
+    return s;
+}
+
+/* ----- threat-space search (VCF/VCF2 style) ----- */
+/* Return 1 if side to move has a forced win within depth_rem plies,
+ * -1 if forced loss, 0 unknown.
+ * VCF2: if we create a double threat, it's a forced win.
+ */
+static int threat_space_search(Position *p, int depth_rem, clock_t start_time, int *timeout_flag) {
+    if (*timeout_flag) return 0;
+    if (depth_rem <= 0) return 0;
+    if (timed_out(start_time)) { *timeout_flag = 1; return 0; }
+
+    /* TT probe */
+    int cached = vcf_probe(p, depth_rem);
+    if (cached != 0) return cached;
+
+    /* If opponent already has 4 (previous mover), this node is losing. */
+    if (has_won_bb(opponent_bb(p))) return -1;
+
+    int moves[7], mcount = 0;
+    gen_moves(p, moves, &mcount);
+    if (mcount == 0) return 0;
+
+    /* If opponent has immediate wins now, restrict us to blocking them. */
+    Position opp_now = *p;
+    flip_player(&opp_now);
+    int opp_win_cols[7];
+    int opp_win_count = list_immediate_wins(&opp_now, opp_win_cols);
+    if (opp_win_count > 0) {
+        int filtered[7], fcount = 0;
+        for (int i = 0; i < opp_win_count; i++) {
+            if (can_play(p, opp_win_cols[i])) filtered[fcount++] = opp_win_cols[i];
+        }
+        if (fcount == 0) {
+            vcf_store(p, depth_rem, -1);
+            return -1;
+        }
+        mcount = fcount;
+        for (int i = 0; i < fcount; i++) moves[i] = filtered[i];
+    }
+
+    /* Immediate win available? */
+    for (int i = 0; i < mcount; i++) {
+        Position child = *p;
+        make_move(&child, moves[i]);
+        if (has_won_bb(opponent_bb(&child))) {
+            vcf_store(p, depth_rem, 1);
+            return 1;
+        }
+    }
+
+    /* Try to prove a forced win by chaining threats:
+     * - If we make a double threat, we win (VCF2).
+     * - If single threat, opponent must block that square; all blocks must fail.
+     */
+    int best_result = 0;
+    for (int i = 0; i < mcount; i++) {
+        Position child = *p;
+        make_move(&child, moves[i]);
+
+        /* our threats after this move (flip POV back to us) */
+        Position my_view = child;
+        flip_player(&my_view);
+        int win_cols[7];
+        int wcount = list_immediate_wins(&my_view, win_cols);
+        if (wcount == 0) {
+            /* VCT extension: if no immediate threat, see if all opponent replies still lose
+             * to a threat win within remaining depth.
+             */
+            if (depth_rem >= 4) {
+                int opp_moves[7], ocount = 0;
+                gen_moves(&child, opp_moves, &ocount);
+                int opp_can_escape = 0;
+                for (int j = 0; j < ocount; j++) {
+                    Position reply = child;
+                    make_move(&reply, opp_moves[j]);
+                    if (has_won_bb(opponent_bb(&reply))) { opp_can_escape = 1; break; }
+                    int res = threat_space_search(&reply, depth_rem - 2, start_time, timeout_flag);
+                    if (*timeout_flag) return 0;
+                    if (res != 1) { opp_can_escape = 1; break; }
+                }
+                if (!opp_can_escape) {
+                    vcf_store(p, depth_rem, 1);
+                    return 1;
+                }
+            }
+            continue; /* not forcing enough otherwise */
+        }
+
+        /* if any winning col is unplayable by opponent, it's a forced win */
+        int opponent_blocks[7];
+        int blockable = 0;
+        for (int k = 0; k < wcount; k++) {
+            if (!can_play(&child, win_cols[k])) {
+                vcf_store(p, depth_rem, 1);
+                return 1;
+            }
+            opponent_blocks[blockable++] = win_cols[k];
+        }
+
+        /* double threat -> forced win (opponent can only play one move) */
+        if (blockable >= 2) {
+            vcf_store(p, depth_rem, 1);
+            return 1;
+        }
+
+        /* opponent must block one of the winning cols; verify all replies fail */
+        int opp_cannot_escape = 1;
+
+        /* opponent immediate winning replies pruning (ladder-like) */
+        for (int b = 0; b < blockable; b++) {
+            Position reply = child;
+            make_move(&reply, opponent_blocks[b]);
+            if (has_won_bb(opponent_bb(&reply))) { opp_cannot_escape = 0; break; }
+
+            /* if opponent after blocking gains multiple immediate wins, treat as escape */
+            Position our_again = reply;
+            flip_player(&our_again);
+            int opp_wins_after[7];
+            int opp_wins_cnt = list_immediate_wins(&our_again, opp_wins_after);
+            if (opp_wins_cnt >= 2) { opp_cannot_escape = 0; break; }
+            if (opp_wins_cnt == 1 && !can_play(&reply, opp_wins_after[0])) {
+                /* illegal block, ignore */
+            }
+
+            int res = threat_space_search(&reply, depth_rem - 2, start_time, timeout_flag);
+            if (*timeout_flag) return 0;
+            if (res != 1) { opp_cannot_escape = 0; break; }
+        }
+        if (opp_cannot_escape) {
+            vcf_store(p, depth_rem, 1);
+            return 1;
+        }
+    }
+
+    /* If we could not prove a win, check if opponent has a forced win within remaining depth. */
+    if (depth_rem > 1) {
+        Position opp = *p;
+        flip_player(&opp);
+        int res = threat_space_search(&opp, depth_rem - 1, start_time, timeout_flag);
+        if (*timeout_flag) return 0;
+        if (res == 1) {
+            vcf_store(p, depth_rem, -1);
+            return -1;
+        }
+    }
+
+    vcf_store(p, depth_rem, best_result);
+    return best_result;
+}
+
+/* Root helper: return 1-based column of forced win, or 0 if none/unknown. */
+static int threat_space_root(const Position *p, int depth_limit, clock_t start_time) {
+    int timeout_flag = 0;
+    int moves[7], mcount = 0;
+    gen_moves(p, moves, &mcount);
+    for (int i = 0; i < mcount; i++) {
+        Position child = *p;
+        make_move(&child, moves[i]);
+        if (has_won_bb(opponent_bb(&child))) return moves[i] + 1;
+
+        int opp_moves[7], ocount = 0;
+        gen_moves(&child, opp_moves, &ocount);
+        int opp_can_escape = 0;
+        /* if our move already created a double threat, it's winning */
+        Position my_view = child;
+        flip_player(&my_view);
+        int win_cols[7];
+        int wcount = list_immediate_wins(&my_view, win_cols);
+        if (wcount >= 2) return moves[i] + 1;
+
+        for (int j = 0; j < ocount; j++) {
+            Position reply = child;
+            make_move(&reply, opp_moves[j]);
+            if (has_won_bb(opponent_bb(&reply))) { opp_can_escape = 1; break; }
+            int res = threat_space_search(&reply, depth_limit - 2, start_time, &timeout_flag);
+            if (timeout_flag) break;
+            if (res != 1) { opp_can_escape = 1; break; }
+        }
+        if (timeout_flag) break;
+        if (!opp_can_escape) return moves[i] + 1;
+    }
+    return 0;
 }
 
 /* ----- timing ----- */
@@ -277,6 +569,19 @@ static int count_immediate_wins(const Position *p) {
         Position tmp = *p;
         make_move(&tmp, c);
         if (has_won_bb(opponent_bb(&tmp))) wins++;
+    }
+    return wins;
+}
+/* collect columns that win immediately for side-to-move; returns count */
+static int list_immediate_wins(const Position *p, int cols_out[7]) {
+    int wins = 0;
+    for (int c = 0; c < COLS; c++) {
+        if (!can_play(p, c)) continue;
+        Position tmp = *p;
+        make_move(&tmp, c);
+        if (has_won_bb(opponent_bb(&tmp))) {
+            cols_out[wins++] = c;
+        }
     }
     return wins;
 }
@@ -385,7 +690,7 @@ static int negamax(Position *p,
 
         /* opponent immediate wins cost big */
         Position opp = *p;
-        opp.position ^= opp.mask;
+        flip_player(&opp);
         int opp_wins = count_immediate_wins(&opp);
         if (opp_wins > 0) return -WIN_SCORE + (max_depth - depth_rem);
 
@@ -437,7 +742,7 @@ static int negamax(Position *p,
     int scores[7];
     /* Precompute opponent immediate wins for block priority */
     Position opp_view = *p;
-    opp_view.position ^= opp_view.mask;
+    flip_player(&opp_view);
     int opp_winning_cols[7];
     int opp_wcount = 0;
     for (int oc = 0; oc < COLS; oc++) {
@@ -457,15 +762,15 @@ static int negamax(Position *p,
         make_move(&child, c);
         /* If this move wins immediately, boost its priority heavily */
         if (has_won_bb(opponent_bb(&child))) {
-            s += 12000;
+            s += 5000;  /* immediate win */
         }
         /* If this move blocks an opponent immediate win, boost */
         for (int k = 0; k < opp_wcount; k++) {
-            if (opp_winning_cols[k] == c) { s += 8000; break; }
+            if (opp_winning_cols[k] == c) { s += 2000; break; }
         }
         /* If this move prevents opponent immediate win, boost modestly */
         Position opp_view_child = child;
-        opp_view_child.position ^= opp_view_child.mask; /* flip POV */
+        flip_player(&opp_view_child); /* flip POV */
         int opp_can_win = 0;
         for (int oc = 0; oc < COLS; oc++) {
             if (!can_play(&opp_view_child, oc)) continue;
@@ -473,7 +778,7 @@ static int negamax(Position *p,
             make_move(&t, oc);
             if (has_won_bb(opponent_bb(&t))) { opp_can_win = 1; break; }
         }
-        if (!opp_can_win) s += 200;
+        if (!opp_can_win) s += 200;         /* urgent non-losing move */
 
         s += evaluate_position_internal(&child, 0) / 32;   /* cheap heuristic lookahead */
         /* history heuristic */
@@ -561,8 +866,7 @@ int getBotMoveHard(char board[ROWS][COLS], char bot, char opponent) {
     (void)opponent; /* board contents + bot char define everything */
     init_zobrist();
 
-    /* Build Position: position = stones of side to move (bot),
-       mask = all stones */
+    /* Build Position bitboards + zobrist */
     init_tt();
     for (int i = 0; i < MAX_PLY; i++) {
         killer_moves[0][i] = -1;
@@ -570,9 +874,11 @@ int getBotMoveHard(char board[ROWS][COLS], char bot, char opponent) {
     }
     for (int i = 0; i < 7; i++) history_table[i] = 0;
     Position pos;
-    pos.position = 0;
-    pos.mask     = 0;
+    pos.bb[0] = pos.bb[1] = 0;
+    pos.zkey = 0;
+    pos.player_to_move = 0;
 
+    int bot_count = 0, opp_count = 0;
     for (int c = 0; c < COLS; c++) {
         for (int r = 0; r < ROWS; r++) {
             char cell = board[r][c];
@@ -580,16 +886,25 @@ int getBotMoveHard(char board[ROWS][COLS], char bot, char opponent) {
             int row_from_bottom = ROWS - 1 - r;
             int idx = c * 7 + row_from_bottom;
             unsigned long long bit = 1ULL << idx;
-            pos.mask |= bit;
-            if (cell == bot) {
-                pos.position |= bit;
+            int owner = (cell == bot) ? 0 : 1;
+            if (owner == 0) bot_count++; else opp_count++;
+            pos.bb[owner] |= bit;
+            if (row_from_bottom < 6) {
+                pos.zkey ^= zobrist[c][row_from_bottom][owner];
             }
         }
     }
+    /* determine side to move from counts */
+    pos.player_to_move = (bot_count == opp_count) ? 0 : 1;
+    if (pos.player_to_move) pos.zkey ^= zobrist_side;
 
     /* Advance TT generation to age out old entries without a full clear */
     tt_generation++;
     if (tt_generation == 0) tt_generation = 1; /* avoid 0 to keep "unused" distinct */
+    vcf_generation++;
+    if (vcf_generation == 0) vcf_generation = 1;
+
+    clock_t start_time = clock();
 
     /* Opening book (only very early) */
     int ob_move = opening_book_move(board, bot);
@@ -615,22 +930,26 @@ int getBotMoveHard(char board[ROWS][COLS], char bot, char opponent) {
         /* simulate opponent point of view first:
          * flip "player to move", then drop piece
          */
-        tmp.position ^= tmp.mask;
+        flip_player(&tmp);
         make_move(&tmp, c);
         if (has_won_bb(opponent_bb(&tmp))) {
             return c + 1;
         }
     }
 
-    /* iterative deepening with time limit + aspiration windows */
-    int empties = 0;
-    for (int r = 0; r < ROWS; r++)
-        for (int c = 0; c < COLS; c++)
-            if (board[r][c] == '.') empties++;
+    /* Late-game threat-space search to catch forced wins/defenses quickly. */
+    int empties = empties_on_board(&pos);
+    if (empties <= 12) {
+        int tss_depth = empties < VCF_MAX_DEPTH ? empties : VCF_MAX_DEPTH;
+        int tss_move = threat_space_root(&pos, tss_depth, start_time);
+        if (tss_move >= 1 && board[0][tss_move - 1] == '.') {
+            return tss_move;
+        }
+    }
 
+    /* iterative deepening with time limit + aspiration windows */
     int depth_cap = empties;        /* theoretical maximum remaining ply */
 
-    clock_t start_time = clock();
     int timeout_flag = 0;
     int node_counter = 0;
     int best_move = 4;              /* default center (column index 3 -> return 4) */
