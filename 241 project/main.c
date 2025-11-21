@@ -5,7 +5,8 @@
 #include <ctype.h>
 #include "io.h"
 #include "engine.h"
-#include "bot_medium.h"  // 🔹 new include for medium difficulty bot
+#include "bot_medium.h"
+#include "bot_hard.h"
 
 void print_board(char board[ROWS][COLS]) {
     for (int r = 0; r < ROWS; r++) {
@@ -29,19 +30,21 @@ int is_exit_command(const char *input) {
 
 int main(void) {
     setbuf(stdout, NULL);
+    srand((unsigned)time(NULL));
     printf("Welcome to Connect Four!\n");
     printf("Type 'exit' anytime to quit.\n\n");
 
     char board[ROWS][COLS];
     char players[2] = {'A', 'B'};
     int current = 0;
+    int bot_index = 1;   // 0 or 1; will be chosen by user in bot mode
     char again;
 
     int bot_enabled = 0;
     char mode[20];
     char difficulty[20] = "easy";  // default
 
-    // ✅ Choose mode (bot or multiplayer)
+    // Choose mode (bot or multiplayer)
     while (1) {
         printf("Type 'bot' to play against a bot, or 'multiplayer' for two players: ");
         scanf("%19s", mode);
@@ -57,9 +60,9 @@ int main(void) {
         if (strcmp(mode, "bot") == 0) {
             bot_enabled = 1;
 
-            // ✅ Choose difficulty
+            // Choose difficulty
             while (1) {
-                printf("Choose difficulty ('easy' or 'medium'): ");
+                printf("Choose difficulty ('easy', 'medium', or 'hard'): ");
                 scanf("%19s", difficulty);
 
                 if (is_exit_command(difficulty)) {
@@ -76,36 +79,50 @@ int main(void) {
                 } else if (strcmp(difficulty, "medium") == 0) {
                     printf("Starting bot mode (medium difficulty)...\n");
                     break;
+                } else if (strcmp(difficulty, "hard") == 0) {
+                    printf("Starting bot mode (HARD - very strong)...\n");
+                    break;
                 } else {
-                    printf("Invalid difficulty! Please choose 'easy' or 'medium'.\n");
+                    printf("Invalid difficulty! Please choose 'easy', 'medium', or 'hard'.\n");
                 }
             }
+            while (1) {
+                printf("Who starts? Type 'bot' or 'player': ");
+                char starter[20];
+                scanf("%19s", starter);
+                for (int i = 0; starter[i]; i++) starter[i] = tolower(starter[i]);
+                if (strcmp(starter, "bot") == 0) { bot_index = 0; break; }
+                if (strcmp(starter, "player") == 0) { bot_index = 1; break; }
+                if (is_exit_command(starter)) { printf("Exiting game. Goodbye!\n"); return 0; }
+                printf("Invalid choice. Please type 'bot' or 'player'.\n");
+            }
+            printf("Starting bot mode. %s begins.\n", bot_index == 0 ? "Bot" : "Human");
             break;
-        } 
-        else if (strcmp(mode, "multiplayer") == 0) {
+        } else if (strcmp(mode, "multiplayer") == 0) {
             printf("Starting multiplayer mode...\n");
             break;
-        } 
-        else {
-            printf("Invalid input! Please type 'bot' or 'multiplayer'.\n");
+        } else {
+            printf("Invalid mode! Please type 'bot' or 'multiplayer'.\n");
         }
     }
 
     while (getchar() != '\n'); // clear buffer
 
-    // ✅ Main game loop
+    // Main game loop
     do {
         init_board(board);
         int game_over = 0;
-        current = 0; // reset turn each round
+        current = bot_enabled ? bot_index : 0; // random start if bot mode
 
         while (!game_over) {
             print_board(board);
 
             int col;
-            if (bot_enabled && current == 1) {
-                if (strcmp(difficulty, "medium") == 0)
-                    col = getBotMoveMedium(board, players[1], players[0]);
+            if (bot_enabled && current == bot_index) {
+                if (strcmp(difficulty, "hard") == 0)
+                    col = getBotMoveHard(board, players[bot_index], players[1 - bot_index]);
+                else if (strcmp(difficulty, "medium") == 0)
+                    col = getBotMoveMedium(board, players[bot_index], players[1 - bot_index]);
                 else
                     col = getBotMoveEasy(board);
 
@@ -122,7 +139,7 @@ int main(void) {
 
             if (check_winner(board, row, col - 1)) {
                 print_board(board);
-                if (bot_enabled && current == 1)
+                if (bot_enabled && current == bot_index)
                     printf("Bot wins!\n");
                 else
                     printf("Player %c wins!\n", players[current]);

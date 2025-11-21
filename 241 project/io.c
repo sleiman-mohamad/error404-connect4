@@ -23,8 +23,7 @@ int getColumnIn(char player) {
         
         if (result != 1) {
             printf("Invalid input! Please enter a number from 1 to 7.\n");
-            
-            while (getchar() != '\n');
+            clear_input_buffer();
             continue;
         }
 
