@@ -38,6 +38,7 @@ int main(void) {
     char players[2] = {'A', 'B'};
     int current = 0;
     int bot_index = 1;   // 0 or 1; will be chosen by user in bot mode
+    int bot_starts = 0;  // 1 if bot should start when bot mode is enabled
     char again;
 
     int bot_enabled = 0;
@@ -91,8 +92,8 @@ int main(void) {
                 char starter[20];
                 scanf("%19s", starter);
                 for (int i = 0; starter[i]; i++) starter[i] = tolower(starter[i]);
-                if (strcmp(starter, "bot") == 0) { bot_index = 0; break; }
-                if (strcmp(starter, "player") == 0) { bot_index = 1; break; }
+                if (strcmp(starter, "bot") == 0) { bot_index = 0; bot_starts = 1; break; }
+                if (strcmp(starter, "player") == 0) { bot_index = 1; bot_starts = 0; break; }
                 if (is_exit_command(starter)) { printf("Exiting game. Goodbye!\n"); return 0; }
                 printf("Invalid choice. Please type 'bot' or 'player'.\n");
             }
@@ -112,7 +113,12 @@ int main(void) {
     do {
         init_board(board);
         int game_over = 0;
-        current = bot_enabled ? bot_index : 0; // random start if bot mode
+        /* Decide who starts this round */
+        if (bot_enabled) {
+            current = bot_starts ? bot_index : 1 - bot_index;
+        } else {
+            current = 0;
+        }
 
         while (!game_over) {
             print_board(board);
