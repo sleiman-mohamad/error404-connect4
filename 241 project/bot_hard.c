@@ -16,7 +16,7 @@
 #define WIN_SCORE      1000000
 #define TIME_LIMIT_SEC 15.0   /* hard limit per move */
 /* Set to 1 to enable per-move logging */
-#define LOG_MOVES 0
+#define LOG_MOVES 1
 
 /* ---- Bitboard layout ----
  * 7 bits per column
@@ -71,6 +71,8 @@ static inline void flip_player(Position *p);
 static inline int popcount_u64(unsigned long long x);
 static inline int column_height(unsigned long long occ, int col);
 static int parity_score(const Position *p);
+static int player_side_three_threat(const Position *p, int player, int *col_out);
+static int creates_side_fork(Position *p, int my_move_col);
 static const int VCF_MAX_DEPTH = 24;
 
 /* ----- win detection on a single bitboard ----- */
@@ -106,6 +108,27 @@ static inline unsigned long long mask_all(const Position *p) {
 
 static inline int can_play(const Position *p, int col) {
     return (mask_all(p) & top_mask(col)) == 0;
+}
+
+static inline int col_full(const Position *p, int col) {
+    return !can_play(p, col);
+}
+
+/* Heuristic: consider center diagonals "secured" if we already have support
+ * in column 4 and one of 3 or 5 at row 2 or higher for the current POV.
+ * This is a conservative proxy; it does not attempt a full proof.
+ */
+static int diagonal_secured_center(const Position *p) {
+    unsigned long long mine = p->bb[p->player_to_move];
+    for (int row = 2; row <= 5; row++) {
+        unsigned long long b3 = 1ULL << (3 * 7 + row);
+        unsigned long long b4 = 1ULL << (4 * 7 + row);
+        unsigned long long b5 = 1ULL << (5 * 7 + row);
+        if ((mine & b4) && ((mine & b3) || (mine & b5))) {
+            return 1;
+        }
+    }
+    return 0;
 }
 
 static inline int empties_on_board(const Position *p) {
@@ -154,6 +177,31 @@ static inline int popcount_u64(unsigned long long x) {
 static inline int column_height(unsigned long long occ, int col) {
     unsigned long long col_mask = 0x3FULL << (col * 7); /* 6 bits + sentinel */
     return popcount_u64(occ & col_mask);
+}
+
+/* Can the given player stack to exactly 3 stones next move in a side column? */
+static int player_can_stack_to_three(const Position *p, int player, int col) {
+    unsigned long long occ = mask_all(p);
+    if (occ & top_mask(col)) return 0; /* column full */
+    int height = column_height(occ, col);
+    if (height < 2) return 0;          /* need at least two stones already */
+    /* check all occupied cells belong to the player and are contiguous from bottom */
+    unsigned long long shifted = p->bb[player] >> (col * 7);
+    unsigned long long mask = (1ULL << height) - 1ULL; /* bottom "height" bits */
+    return (shifted & mask) == mask;   /* all occupied cells belong to player */
+}
+
+/* Detect side-column (1,2,6,7 in human terms) vertical-3 threats for player */
+static int player_side_three_threat(const Position *p, int player, int *col_out) {
+    static const int SIDE_COLS[4] = {0, 1, 5, 6};
+    for (int i = 0; i < 4; i++) {
+        int c = SIDE_COLS[i];
+        if (player_can_stack_to_three(p, player, c)) {
+            if (col_out) *col_out = c;
+            return 1;
+        }
+    }
+    return 0;
 }
 
 /* any legal moves left? */
@@ -302,6 +350,15 @@ static int evaluate_position_internal(const Position *p, int include_threats) {
         score += v * 4;
     }
 
+    /* edge control: avoid giving away edge columns */
+    for (int c = 0; c < 7; c += 6) { /* columns 0 and 6 */
+        for (int r = 0; r < 6; r++) {
+            int v = cell_at(p, r, c);
+            score += v * -2;          /* we prefer not to occupy edges early */
+            if (v == -1) score -= 4;   /* opponent owning edges is even worse */
+        }
+    }
+
     /* parity / tempo bias: odd remaining cells in a column favor side to move */
     score += parity_score(p);
 
@@ -340,6 +397,12 @@ static int evaluate_position_internal(const Position *p, int include_threats) {
         score += (threats_me - threats_opp) * 200;
         if (threats_me >= 2) score += 5000;   /* double threat for current player */
         if (threats_opp >= 2) score -= 5000;  /* opponent double threat is scary */
+
+        /* Side-column vertical-3 danger (opponent) */
+        int opp = p->player_to_move ^ 1;
+        if (player_side_three_threat(p, opp, NULL)) {
+            score -= 800; /* steer away from letting opponent build the trap */
+        }
     }
 
     return score;
@@ -592,69 +655,16 @@ static int list_immediate_wins(const Position *p, int cols_out[7]) {
     return wins;
 }
 
-/* ----- small opening book (board-based) ----- */
-/* Returns 1-based column index, or 0 if no book move. */
+/* Opening book disabled: always fall back to search. */
 static int opening_book_move(char board[ROWS][COLS], char bot) {
-    int stones = 0;
-    int my_stones = 0;
-    int opp_stones = 0;
-
+    (void)bot;
+    /* If board is empty, open in center (column 4). Otherwise, defer to search. */
     for (int r = 0; r < ROWS; r++) {
         for (int c = 0; c < COLS; c++) {
-            char cell = board[r][c];
-            if (cell != '.') {
-                stones++;
-                if (cell == bot) my_stones++;
-                else opp_stones++;
-            }
+            if (board[r][c] != '.') return 0;
         }
     }
-
-    /* Only use book very early (first 2–3 plies) */
-    if (stones > 4) return 0;
-
-    /* First move of the game: always take center if free */
-    if (stones == 0) {
-        if (board[ROWS - 1][3] == '.') return 4; /* column 4 (index 3) */
-        return 0;
-    }
-
-    /* If we're second player and opponent opened somewhere */
-    if (stones == 1 && my_stones == 0 && opp_stones == 1) {
-        int opp_col = -1;
-        for (int c = 0; c < COLS; c++) {
-            for (int r = ROWS - 1; r >= 0; r--) {
-                if (board[r][c] != '.') {
-                    opp_col = c;
-                    goto found_opp;
-                }
-            }
-        }
-    found_opp:
-        if (opp_col == -1) return 0;
-
-        /* If opponent did NOT play center, we take center. */
-        if (opp_col != 3 && board[ROWS - 1][3] == '.') {
-            return 4;
-        } else if (opp_col == 3) {
-            /* Opponent played center; reply next to center (col 3 or 5) */
-            if (board[ROWS - 1][2] == '.') return 3;
-            if (board[ROWS - 1][4] == '.') return 5;
-        }
-        return 0;
-    }
-
-    /* If we opened center and opponent replied, we keep playing near center. */
-    if (stones == 2 && my_stones == 1 && opp_stones == 1) {
-        /* If we already have center, take one of the adjacent columns. */
-        if (board[ROWS - 1][3] == bot) {
-            if (board[ROWS - 1][2] == '.') return 3;
-            if (board[ROWS - 1][4] == '.') return 5;
-        }
-        return 0;
-    }
-
-    return 0;
+    return 4;
 }
 
 /* ----- negamax with alpha-beta + TT + time limit ----- */
@@ -762,7 +772,13 @@ static int negamax(Position *p,
 
     for (int i = 0; i < mcount; i++) {
         int c = moves[i];
-        int s = 6 - (c > 3 ? c - 3 : 3 - c);   /* center bias */
+        int s = 6 - (c > 3 ? c - 3 : 3 - c);
+            /* skip moves that create fork-loss pattern */
+    if (creates_side_fork(p, c)) {
+        scores[i] = -1000000000;
+        continue;
+    }
+   /* center bias */
 
         Position child = *p;
         make_move(&child, c);
@@ -773,6 +789,10 @@ static int negamax(Position *p,
         /* If this move blocks an opponent immediate win, boost */
         for (int k = 0; k < opp_wcount; k++) {
             if (opp_winning_cols[k] == c) { s += 2000; break; }
+        }
+        /* If this move allows opponent to stack to 3 in side columns, penalize */
+        if (player_side_three_threat(&child, child.player_to_move, NULL)) {
+            s -= 1200;
         }
         /* If this move prevents opponent immediate win, boost modestly */
         Position opp_view_child = child;
@@ -817,11 +837,6 @@ static int negamax(Position *p,
         Position child = *p;
         make_move(&child, col);
 
-        /* Late-move pruning for shallow nodes */
-        if (depth_rem <= 2 && i >= 3 && scores[i] + 200 < alpha) {
-            continue;
-        }
-
         int score = -negamax(&child,
                              depth_rem - 1,
                              max_depth,
@@ -864,6 +879,54 @@ static int negamax(Position *p,
     else                        e->flag = 0; /* exact */
 
     return best_val;
+}
+
+/* Detect if opponent has a dangerous side-column vertical threat (3-stack)
+   AND our move allows a horizontal fork around rows 2-4. */
+static int creates_side_fork(Position *p, int my_move_col) {
+    Position after = *p;
+    make_move(&after, my_move_col);
+
+    unsigned long long opp = after.bb[after.player_to_move]; /* opponent POV */
+    unsigned long long occ = mask_all(&after);
+
+    /* Check side columns 0,1,5,6 */
+    int sides[4] = {0,1,5,6};
+    for (int i = 0; i < 4; i++) {
+        int c = sides[i];
+        int h = column_height(occ, c);
+
+        /* If opponent already has exactly 3 stones stacked */
+        if (h >= 3) {
+            int r0 = c * 7 + 0;
+            int r1 = c * 7 + 1;
+            int r2 = c * 7 + 2;
+
+            if ((opp & (1ULL << r0)) &&
+                (opp & (1ULL << r1)) &&
+                (opp & (1ULL << r2))) {
+
+                /* Now scan rows 1–3 for horizontal fork possibilities */
+                for (int cc = 0; cc < COLS - 3; cc++) {
+                    for (int row = 1; row <= 3; row++) {
+                        int opp_count = 0, empty_count = 0;
+
+                        for (int k = 0; k < 4; k++) {
+                            unsigned long long bit =
+                                1ULL << ((cc + k) * 7 + row);
+                            if (opp & bit) opp_count++;
+                            else if (!(occ & bit)) empty_count++;
+                        }
+
+                        if (opp_count == 2 && empty_count == 2)
+                            return 1;   /* This move allows a fork */
+                    }
+                }
+            }
+        }
+    }
+
+    return 0;
 }
 
 /* ==================== public entry ==================== */
@@ -937,13 +1000,27 @@ int getBotMoveHard(char board[ROWS][COLS], char bot, char opponent) {
         }
     }
 
-    /* Late-game threat-space search to catch forced wins/defenses quickly. */
+    /* Emergency block: prevent opponent from stacking to 3 in side columns */
+    int danger_col = -1;
+    if (player_side_three_threat(&pos, 1, &danger_col) && can_play(&pos, danger_col)) {
+        /* try to block unless it immediately loses */
+        Position tmp = pos;
+        make_move(&tmp, danger_col);
+        Position opp_check = tmp;
+        flip_view(&opp_check);
+        if (!has_won_bb(opponent_bb(&opp_check))) {
+            return danger_col + 1;
+        }
+    }
+
+    /* Late-game threat-space search to catch forced wins/defenses quickly (hint only). */
+    int tss_hint = -1;
     int empties = empties_on_board(&pos);
-    if (empties <= 12) {
+    if (empties <= 24) {
         int tss_depth = empties < VCF_MAX_DEPTH ? empties : VCF_MAX_DEPTH;
         int tss_move = threat_space_root(&pos, tss_depth, start_time);
         if (tss_move >= 1 && board[0][tss_move - 1] == '.') {
-            return tss_move;
+            tss_hint = tss_move - 1; /* store as 0-based to prefer in ordering */
         }
     }
 
@@ -982,6 +1059,40 @@ int getBotMoveHard(char board[ROWS][COLS], char bot, char opponent) {
                     break;
                 }
             }
+        }
+        /* Prefer threat-space hint if present */
+        if (tss_hint >= 0) {
+            for (int i = 0; i < mcount; i++) {
+                if (moves[i] == tss_hint) {
+                    int tmp = moves[0];
+                    moves[0] = moves[i];
+                    moves[i] = tmp;
+                    break;
+                }
+            }
+        }
+
+        
+      
+
+        /* Discard moves that hand opponent an immediate double threat, if we have safer options */
+        int safe_moves[7];
+        int safe_count = 0;
+        for (int i = 0; i < mcount; i++) {
+            int c = moves[i];
+            Position child = pos;
+            make_move(&child, c);
+            Position opp_view = child;
+            flip_view(&opp_view);
+            int opp_wins = count_immediate_wins(&opp_view);
+          if (opp_wins >= 2) continue;
+if (creates_side_fork(&pos, c)) continue;
+
+            safe_moves[safe_count++] = c;
+        }
+        if (safe_count > 0) {
+            for (int i = 0; i < safe_count; i++) moves[i] = safe_moves[i];
+            mcount = safe_count;
         }
         if (mcount == 0) break;
 
@@ -1044,18 +1155,26 @@ int getBotMoveHard(char board[ROWS][COLS], char bot, char opponent) {
         if (timed_out(start_time)) break;
     }
 
-    /* Avoid picking a move that hands the opponent an immediate win */
+    /* Avoid picking a move that hands the opponent an immediate win or double threat */
     if (best_move >= 1 && best_move <= COLS && board[0][best_move - 1] == '.') {
         Position tmp = pos;
         make_move(&tmp, best_move - 1); /* bot makes the move, POV flips to opponent */
-        if (count_immediate_wins(&tmp) > 0) {
+        Position opp_view = tmp;
+        flip_view(&opp_view); /* ensure we count wins from opponent POV */
+        int opp_wins = count_immediate_wins(&opp_view);
+        if (opp_wins > 0) {
+            /* try to find a fallback that avoids immediate loss */
             int safe_move = -1;
             int safe_score = -WIN_SCORE;
             for (int c = 0; c < COLS; c++) {
                 if (!can_play(&pos, c)) continue;
                 Position cand = pos;
                 make_move(&cand, c);
-                if (count_immediate_wins(&cand) > 0) continue; /* still losing immediately */
+                Position opp_after_view = cand;
+                flip_view(&opp_after_view);
+                int opp_after = count_immediate_wins(&opp_after_view);
+                if (opp_after > 1) continue; /* still leaves double threat */
+                if (opp_after > 0) continue; /* still losing immediately */
                 int s = evaluate_position_internal(&cand, 0);
                 if (s > safe_score) { safe_score = s; safe_move = c; }
             }
