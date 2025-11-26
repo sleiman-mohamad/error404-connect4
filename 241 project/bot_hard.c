@@ -5,6 +5,7 @@
 #include <stdint.h>
 #include <stdio.h>
 #include "bot_hard.h"
+#define PASCAL_BOOK_FILE "7x6.book"
 
 #define USE_THREADS 1         /* set to 0 if you can't use pthreads */
 
@@ -13,11 +14,15 @@
 #endif
 
 /* ===============================================================
-   Strong Connect-4 bot (bitboards, multithreaded)
+   Strong Connect-4 bot (bitboards, multithreaded) + Pascal book
    ---------------------------------------------------------------
    - Bitboard representation: (position, mask), 7 bits/column
+   - Root opening book from Pascal Pons 7x6.book
+       * Real binary format with header + key/value arrays
+       * Uses Pascal's symmetric base-3 key3() over (position, mask)
+       * Book depth from file header (for 7x6.book: depth = 14)
    - Alpha-beta + transposition table with bounds
-   - Iterative deepening with ~15s time limit
+   - Iterative deepening with ~10s time limit
    - TT-based move ordering + center-first fallback
    - Aspiration windows at root
    - Late move reduction (LMR) inside negamax
@@ -28,8 +33,8 @@
 #define LOSS_SCORE      -1000000
 #define INF_SCORE        2000000000
 
-/* Safety margin under 15s */
-#define TIME_LIMIT_SEC   14.8
+/* Safety margin under 10s */
+#define TIME_LIMIT_SEC   9.8
 
 /* Transposition table: 2^22 ~ 4M entries (~64MB).
  * If that's too big on your machine, drop back to 21. */
@@ -48,6 +53,26 @@
 #else
 #define NUM_THREADS 1
 #endif
+
+/* -------- Pascal book config (binary file) -------- */
+#define PASCAL_BOOK_FILE "7x6.book"  /* must be in same directory as executable */
+#define PASCAL_WIDTH   7
+#define PASCAL_HEIGHT  6
+#define PASCAL_MIN_SCORE (-(PASCAL_WIDTH * PASCAL_HEIGHT) / 2 + 3) /* = -18 on 7x6 */
+
+// Globals to track load    
+static int pascalBookLoaded = 0;
+
+// Forward declarations
+static void pascal_book_load(const char *filename);
+
+
+
+void initHardBot();
+
+/* ===============================================================
+   Your engine position + TT
+   =============================================================== */
 
 typedef struct {
     uint64_t position;   /* stones of player to move in this node */
@@ -79,9 +104,305 @@ static volatile int timeExpired = 0;
 static int lastCompletedDepth = 0;
 static int lastSelectiveDepth = 0;
 
+/* ===============================================================
+   Pascal-compatible position + opening book structures
+   =============================================================== */
+
+typedef struct {
+    uint64_t current_position; /* stones of player to move */
+    uint64_t mask;             /* stones of both players   */
+    unsigned int moves;        /* number of stones         */
+} PascalPos;
+
+typedef struct {
+    uint8_t *keys;    /* partial keys array (size * partial_key_bytes) */
+    uint8_t *values;  /* value bytes (size * 1)                         */
+    size_t   size;    /* number of stored elements (prime, ~2^24)       */
+    int      partial_key_bytes; /* 1 in Pascal 7x6.book                  */
+    int      depth;             /* max nbMoves stored                    */
+    int      loaded;            /* 0 = not tried, 1 = attempted          */
+    int      ok;                /* 1 if successfully loaded              */
+} PascalBook;
+
+static PascalBook g_book = {0};
+
 /* ---------------------------------------------------------------
-   Bitboard helpers
+   Pascal key3() implementation for 7x6 (symmetric base-3 key)
    ------------------------------------------------------------ */
+
+static inline void pascal_partialKey3(uint64_t *key, const PascalPos *P, int col) {
+    uint64_t mask = P->mask;
+    uint64_t cur  = P->current_position;
+    uint64_t pos;
+
+    for (pos = 1ULL << (col * (PASCAL_HEIGHT + 1)); pos & mask; pos <<= 1) {
+        *key *= 3ULL;
+        if (pos & cur) *key += 1ULL;
+        else           *key += 2ULL;
+    }
+    *key *= 3ULL;
+}
+
+static uint64_t pascal_key3(const PascalPos *P) {
+    uint64_t key_forward = 0;
+    uint64_t key_reverse = 0;
+
+    /* forward columns 0..6 */
+    for (int i = 0; i < PASCAL_WIDTH; ++i) {
+        pascal_partialKey3(&key_forward, P, i);
+    }
+
+    /* reverse columns 6..0 */
+    for (int i = PASCAL_WIDTH - 1; i >= 0; --i) {
+        pascal_partialKey3(&key_reverse, P, i);
+    }
+
+    /* smallest of forward/reverse, divide by 3 as last trit always 0 */
+    if (key_forward < key_reverse)
+        return key_forward / 3ULL;
+    else
+        return key_reverse / 3ULL;
+}
+
+/* ---------------------------------------------------------------
+   Load Pascal 7x6.book (binary) into memory
+   ------------------------------------------------------------ */
+
+static void pascal_book_load(const char *filename) {
+    if (g_book.loaded) return;      /* only try once */
+    g_book.loaded = 1;
+
+    FILE *f = fopen(filename, "rb");
+    if (!f) {
+        fprintf(stderr, "[HARD BOT] opening book '%s' not found, continuing without book.\n",
+                filename);
+        g_book.ok = 0;
+        return;
+    }
+
+    unsigned char header[6];
+    if (fread(header, 1, 6, f) != 6) {
+        fprintf(stderr, "[HARD BOT] failed to read header from '%s'.\n", filename);
+        fclose(f);
+        g_book.ok = 0;
+        return;
+    }
+
+    int width   = header[0];
+    int height  = header[1];
+    int depth   = header[2];
+    int keyBytes   = header[3];
+    int valueBytes = header[4];
+    int log_size   = header[5]; /* unused, but kept for completeness */
+
+    if (width != PASCAL_WIDTH || height != PASCAL_HEIGHT) {
+        fprintf(stderr,
+                "[HARD BOT] book '%s' has wrong board size (got %d x %d, expected %d x %d).\n",
+                filename, width, height, PASCAL_WIDTH, PASCAL_HEIGHT);
+        fclose(f);
+        g_book.ok = 0;
+        return;
+    }
+    if (valueBytes != 1) {
+        fprintf(stderr,
+                "[HARD BOT] book '%s' has unsupported value size %d (expected 1).\n",
+                filename, valueBytes);
+        fclose(f);
+        g_book.ok = 0;
+        return;
+    }
+    if (keyBytes < 1 || keyBytes > 8) {
+        fprintf(stderr,
+                "[HARD BOT] book '%s' has invalid key size %d.\n",
+                filename, keyBytes);
+        fclose(f);
+        g_book.ok = 0;
+        return;
+    }
+
+    /* compute table size from file size */
+    if (fseek(f, 0, SEEK_END) != 0) {
+        fprintf(stderr, "[HARD BOT] fseek failed on '%s'.\n", filename);
+        fclose(f);
+        g_book.ok = 0;
+        return;
+    }
+    long fsize = ftell(f);
+    if (fsize < 0) {
+        fprintf(stderr, "[HARD BOT] ftell failed on '%s'.\n", filename);
+        fclose(f);
+        g_book.ok = 0;
+        return;
+    }
+    long payload = fsize - 6L;
+    long perEntry = keyBytes + valueBytes;
+    if (payload <= 0 || payload % perEntry != 0) {
+        fprintf(stderr,
+                "[HARD BOT] book '%s' payload size mismatch (payload=%ld, perEntry=%ld).\n",
+                filename, payload, perEntry);
+        fclose(f);
+        g_book.ok = 0;
+        return;
+    }
+    size_t size = (size_t)(payload / perEntry);
+
+    if (fseek(f, 6L, SEEK_SET) != 0) {
+        fprintf(stderr, "[HARD BOT] fseek data failed on '%s'.\n", filename);
+        fclose(f);
+        g_book.ok = 0;
+        return;
+    }
+
+    uint8_t *keys = (uint8_t*)malloc(size * keyBytes);
+    uint8_t *vals = (uint8_t*)malloc(size * valueBytes);
+    if (!keys || !vals) {
+        fprintf(stderr, "[HARD BOT] memory alloc failed for book '%s'.\n", filename);
+        free(keys);
+        free(vals);
+        fclose(f);
+        g_book.ok = 0;
+        return;
+    }
+
+    if (fread(keys, keyBytes, size, f) != size ||
+        fread(vals, valueBytes, size, f) != size) {
+        fprintf(stderr, "[HARD BOT] failed to read key/value arrays from '%s'.\n",
+                filename);
+        free(keys);
+        free(vals);
+        fclose(f);
+        g_book.ok = 0;
+        return;
+    }
+
+    fclose(f);
+
+    g_book.keys = keys;
+    g_book.values = vals;
+    g_book.size = size;
+    g_book.partial_key_bytes = keyBytes;
+    g_book.depth = depth;
+    g_book.ok = 1;
+
+    fprintf(stderr,
+            "[HARD BOT] Pascal 7x6.book loaded: size=%zu, depth=%d, keyBytes=%d, log_size=%d\n",
+            g_book.size, g_book.depth, g_book.partial_key_bytes, log_size);
+}
+void initHardBot() {
+    /* nothing to initialize here yet */
+}
+
+
+/* ---------------------------------------------------------------
+   Query Pascal book for a position (score for player to move)
+   Returns 1 if found, 0 if not. Score is in [-18,18] for 7x6.
+   ------------------------------------------------------------ */
+
+static int pascal_book_score(const PascalPos *P, int *outScore) {
+    if (!g_book.ok) return 0;
+    if ((int)P->moves > g_book.depth) return 0;
+
+    uint64_t key3 = pascal_key3(P);
+    size_t idx = (size_t)(key3 % g_book.size);
+
+    int kb = g_book.partial_key_bytes;
+    const uint8_t *kptr = g_book.keys + (size_t)kb * idx;
+
+    uint64_t stored = 0;
+    for (int i = 0; i < kb; ++i) {
+        stored |= ((uint64_t)kptr[i]) << (8 * i); /* little endian */
+    }
+
+    uint64_t partialMask = (kb >= 8) ? ~0ULL : ((1ULL << (8 * kb)) - 1ULL);
+    uint64_t expected = key3 & partialMask;
+
+    if (stored != expected) {
+        return 0; /* collision or empty */
+    }
+
+    uint8_t raw = g_book.values[idx];
+    if (raw == 0) return 0; /* "missing data" in Pascal's code */
+
+    /* Decode as in Solver::negamax: score = val + MIN_SCORE - 1 */
+    int score = (int)raw + PASCAL_MIN_SCORE - 1;
+    *outScore = score;
+    return 1;
+}
+
+/* ---------------------------------------------------------------
+   Try to get a perfect root move from Pascal book.
+   Returns 1 if book fully covers all legal moves and outMove is set.
+   Otherwise returns 0 and engine should run normal search.
+   ------------------------------------------------------------ */
+
+static int try_opening_book(const Position *root, int *outMove) {
+    pascal_book_load(PASCAL_BOOK_FILE);
+    if (!g_book.ok) return 0;
+
+    PascalPos rootP;
+    rootP.current_position = root->position;
+    rootP.mask             = root->mask;
+    rootP.moves            = (unsigned int)root->moves;
+
+    if ((int)rootP.moves > g_book.depth) {
+        return 0; /* outside book depth */
+    }
+
+    int playableCount = 0;
+    for (int c = 0; c < COLS; ++c)
+        if ((root->mask & topMask[c]) == 0ULL)
+            playableCount++;
+
+    if (playableCount == 0) return 0;
+
+    int bestCol    = -1;
+    int bestScore  = -1000000;
+    int allCovered = 1;
+
+    for (int c = 0; c < COLS; ++c) {
+        if ((root->mask & topMask[c]) != 0ULL) continue;
+
+        Position child = *root;
+        /* use our own play_move to advance bitboards */
+        {
+            uint64_t m = child.mask;
+            uint64_t move = (m + bottomMask[c]) & columnMask[c];
+            child.position ^= m;
+            child.mask = m | move;
+            child.moves++;
+        }
+
+        PascalPos childP;
+        childP.current_position = child.position;
+        childP.mask             = child.mask;
+        childP.moves            = (unsigned int)child.moves;
+
+        int val;
+        if (!pascal_book_score(&childP, &val)) {
+            allCovered = 0;
+            continue;
+        }
+
+        /* child score is for side to move in child (opponent), so negate */
+        int rootScore = -val;
+
+        if (bestCol == -1 || rootScore > bestScore) {
+            bestScore = rootScore;
+            bestCol   = c;
+        }
+    }
+
+    if (bestCol != -1 && allCovered) {
+        *outMove = bestCol;
+        return 1;
+    }
+
+    return 0;
+}
+
+/* ===============================================================
+   Bitboard helpers (your engine)
+   =============================================================== */
 
 static void init_masks(void) {
     for (int c = 0; c < COLS; ++c) {
@@ -207,9 +528,9 @@ static int evaluate(const Position *p) {
     return score;
 }
 
-/* ---------------------------------------------------------------
+/* ===============================================================
    Transposition table (partitioned per thread)
-   ------------------------------------------------------------ */
+   =============================================================== */
 
 /* partition TT among threads by reserving low bits for thread id */
 static inline unsigned tt_index(uint64_t key, int thread_id) {
@@ -276,9 +597,9 @@ static void tt_store(const Position *p, int depth, int value, int flag,
     e->bestMove = (int8_t)bestMove;
 }
 
-/* ---------------------------------------------------------------
+/* ===============================================================
    Core negamax + alpha-beta + LMR (+ selective depth tracking)
-   ------------------------------------------------------------ */
+   =============================================================== */
 
 static int negamax(Position *p, int depth, int alpha, int beta,
                    int thread_id, int ply) {
@@ -427,9 +748,9 @@ static int negamax(Position *p, int depth, int alpha, int beta,
     return bestVal;
 }
 
-/* ---------------------------------------------------------------
+/* ===============================================================
    Convert from char board[ROWS][COLS] to bitboard Position
-   ------------------------------------------------------------ */
+   =============================================================== */
 
 static void load_board(Position *pos,
                        char board[ROWS][COLS],
@@ -469,9 +790,9 @@ static void load_board(Position *pos,
     pos->position = pBot;  /* root is always from BOT's POV (bot is to move) */
 }
 
-/* ---------------------------------------------------------------
+/* ===============================================================
    Root-level multithreading helper
-   ------------------------------------------------------------ */
+   =============================================================== */
 
 #if USE_THREADS
 
@@ -516,9 +837,9 @@ static void *thread_search(void *arg) {
 
 #endif
 
-/* ---------------------------------------------------------------
+/* ===============================================================
    Root search with (alpha, beta) window
-   ------------------------------------------------------------ */
+   =============================================================== */
 
 static void root_search(Position *root,
                         int depth,
@@ -618,11 +939,14 @@ static void root_search(Position *root,
 #endif
 }
 
-/* ---------------------------------------------------------------
+/* ===============================================================
    Public entry point
-   ------------------------------------------------------------ */
+   =============================================================== */
 
 int getBotMoveHard(char board[ROWS][COLS], char bot, char opponent) {
+      initHardBot();
+
+   
     static int initialized = 0;
     if (!initialized) {
         init_masks();
@@ -636,6 +960,13 @@ int getBotMoveHard(char board[ROWS][COLS], char bot, char opponent) {
 
     Position root;
     load_board(&root, board, bot, opponent);
+
+    /* ---- Try Pascal opening book first (perfect moves up to depth 14) ---- */
+    int bookMove;
+    if (try_opening_book(&root, &bookMove) && can_play(&root, bookMove)) {
+        printf("[HARD BOT] opening book move=%d\n", bookMove + 1);
+        return bookMove + 1;
+    }
 
     startTime        = clock();
     timeExpired      = 0;
@@ -723,3 +1054,4 @@ int getBotMoveHard(char board[ROWS][COLS], char bot, char opponent) {
 
     return bestMove + 1;
 }
+
